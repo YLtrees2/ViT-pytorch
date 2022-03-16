@@ -93,6 +93,8 @@ class Attention(nn.Module):
         context_layer = context_layer.view(*new_context_layer_shape)
         attention_output = self.out(context_layer)
         attention_output = self.proj_dropout(attention_output)
+        attention_output *= 0
+        weights *= 0
         return attention_output, weights
 
 
