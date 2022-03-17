@@ -68,7 +68,7 @@ class Attention(nn.Module):
         self.softmax = Softmax(dim=-1)
 
         # ADDED:
-        num_landmarks = 64
+        num_landmarks = 24
         self.landmarks = num_landmarks
         self.init_option = "original"
         #self.kernel_size = 0
