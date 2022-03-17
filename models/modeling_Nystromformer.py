@@ -67,10 +67,39 @@ class Attention(nn.Module):
 
         self.softmax = Softmax(dim=-1)
 
+        # ADDED:
+        num_landmarks = 32
+        self.landmarks = num_landmarks
+        self.init_option = "original"
+        #self.kernel_size = 0
+        #self.proj = nn.Linear(config.hidden_size, config.hidden_size)
+
+
+
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
         x = x.view(*new_x_shape)
         return x.permute(0, 2, 1, 3)
+
+    # ADDED
+    def iterative_inv(self, mat, n_iter = 2):
+        I = torch.eye(mat.size(-1), device = mat.device)
+        K = mat
+
+        # The entries of K are positive and ||K||_{\infty} = 1 due to softmax
+        #if self.init_option == "original":
+            # This original implementation is more conservative to compute coefficient of Z_0. 
+        #V = 1 / torch.max(torch.sum(K, dim = -2)) * K.transpose(-1, -2)
+        #else:
+        #    # This is the exact coefficient computation, 1 / ||K||_1, of initialization of Z_0, leading to faster convergence. 
+        V = 1 / torch.max(torch.sum(K, dim = -2), dim = -1).values[:, :, None, None] * K.transpose(-1, -2)
+
+        for _ in range(n_iter):
+            KV = torch.matmul(K, V)
+            V = torch.matmul(V/4, 13 * I - torch.matmul(KV, 15 * I - torch.matmul(KV, 7 * I - KV)))
+        return V
+
+
 
     def forward(self, hidden_states):
         mixed_query_layer = self.query(hidden_states)
@@ -80,9 +109,17 @@ class Attention(nn.Module):
         query_layer = self.transpose_for_scores(mixed_query_layer)
         key_layer = self.transpose_for_scores(mixed_key_layer)
         value_layer = self.transpose_for_scores(mixed_value_layer)
+        #print("x.size(): ",mixed_query_layer.size())
+        #print("self.num_attention_heads: ", self.num_attention_heads)
+        #print("self.attention_head_size: ", self.attention_head_size)
+        #print("all_head_size: ", self.all_head_size)
+        #print(query_layer.size())
 
+        #return None
+
+        """
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
-        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+        attention_scores = attention_scores / math.sqrt(self.attention_head_size)#
         attention_probs = self.softmax(attention_scores)
         weights = attention_probs if self.vis else None
         attention_probs = self.attn_dropout(attention_probs)
@@ -93,9 +130,55 @@ class Attention(nn.Module):
         context_layer = context_layer.view(*new_context_layer_shape)
         attention_output = self.out(context_layer)
         attention_output = self.proj_dropout(attention_output)
-        attention_output *= 0
-        if self.vis:
-            weights *= 0
+        """
+        scale = self.attention_head_size ** 0.5
+        query_layer /= scale
+
+        #keys_head_dim = k.size(-1)
+        N = query_layer.size()[2]
+        B = query_layer.size()[0]
+        segs = N // self.landmarks
+        if (N % self.landmarks == 0):
+            keys_landmarks = key_layer.reshape(B, self.num_attention_heads, self.landmarks, segs, self.attention_head_size).mean(dim = -2)
+            queries_landmarks = query_layer.reshape(B, self.num_attention_heads, self.landmarks, segs, self.attention_head_size).mean(dim = -2)
+        else:
+            #print(N, self.landmarks)
+            
+            #return None
+            num_k = (segs + 1) * self.landmarks - N
+            keys_landmarks_f = key_layer[:, :, :num_k * segs, :].reshape(B, self.num_attention_heads, num_k, segs, self.attention_head_size).mean(dim = -2)
+            keys_landmarks_l = key_layer[:, :, num_k * segs:, :].reshape(B, self.num_attention_heads, self.landmarks - num_k, segs + 1, self.attention_head_size).mean(dim = -2)
+            keys_landmarks = torch.cat((keys_landmarks_f, keys_landmarks_l), dim = -2)
+            #print("Middle")
+            queries_landmarks_f = query_layer[:, :, :num_k * segs, :].reshape(B, self.num_attention_heads, num_k, segs, self.attention_head_size).mean(dim = -2)
+            queries_landmarks_l = query_layer[:, :, num_k * segs:, :].reshape(B, self.num_attention_heads, self.landmarks - num_k, segs + 1, self.attention_head_size).mean(dim = -2)
+            queries_landmarks = torch.cat((queries_landmarks_f, queries_landmarks_l), dim = -2)
+
+        kernel_1 = torch.nn.functional.softmax(torch.matmul(query_layer, keys_landmarks.transpose(-1, -2)), dim = -1)
+        kernel_2 = torch.nn.functional.softmax(torch.matmul(queries_landmarks, keys_landmarks.transpose(-1, -2)), dim = -1)
+        kernel_3 = torch.nn.functional.softmax(torch.matmul(queries_landmarks, key_layer.transpose(-1, -2)), dim = -1)
+        x = torch.matmul(torch.matmul(kernel_1, self.iterative_inv(kernel_2)), torch.matmul(kernel_3, value_layer))
+
+        #if self.kernel_size > 0:
+        #    x += self.conv(value_layer)
+
+        x = x.transpose(1, 2).reshape(B, N, -1)
+        #x = self.proj(x)
+        attention_probs = self.attn_dropout(x)
+        #x = v.squeeze(1) + x
+        #attention_output *= 0
+        #if self.vis:
+        #    weights *= 0
+        weights = attention_probs if self.vis else None
+
+        #print("x.size:", x.size(), "attention_prob.size", attention_probs.size())
+
+        x = attention_probs#value_layer.squeeze(1) + attention_probs
+
+        #new_context_layer_shape = x.size()[:-2] + (self.all_head_size,)
+        #context_layer = x#.view(*new_context_layer_shape)
+        attention_output = self.out(x)#context_layer)
+        attention_output = self.proj_dropout(attention_output)
         return attention_output, weights
 
 
